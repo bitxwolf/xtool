@@ -1,0 +1,172 @@
+name: Update My PR Branches
+
+on:
+  schedule:
+    # Runs every three hours at 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, and 21:00 UTC.
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      target_repos:
+        description: 'Specific upstream repository (default: xtool-org/xtool)'
+        required: false
+        default: 'xtool-org/xtool'
+
+concurrency:
+  group: update-my-pr-branches
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  DEFAULT_UPSTREAM_REPOS: xtool-org/xtool
+  FORK_OWNER: ${{ github.repository_owner }}
+  GH_TOKEN: ${{ secrets.GH_PAT || secrets.PERSONAL_ACCESS_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  update-branches:
+    name: Update open PR branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update PR branches
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          TARGET_REPOS="${{ github.event.inputs.target_repos }}"
+          if [ -z "${TARGET_REPOS}" ]; then
+            TARGET_REPOS="${DEFAULT_UPSTREAM_REPOS}"
+          fi
+
+          echo "============================================================"
+          echo "Updating open PR branches for ${TARGET_REPOS}"
+          echo "Fork Owner / Author: ${FORK_OWNER}"
+          echo "============================================================"
+
+          if ! gh auth status >/dev/null 2>&1; then
+            echo "::error::GitHub CLI is not authenticated. Check GH_TOKEN."
+            exit 1
+          fi
+
+          GRAND_TOTAL_PRS=0
+          GRAND_UPDATED_COUNT=0
+          GRAND_UP_TO_DATE_COUNT=0
+          GRAND_FAILED_COUNT=0
+          declare -a ALL_FAILED_ITEMS=()
+
+          for UPSTREAM_REPO in ${TARGET_REPOS}; do
+            echo ""
+            echo "************************************************************"
+            echo "Checking repository: ${UPSTREAM_REPO}"
+            echo "************************************************************"
+
+            echo "Searching for open PRs in ${UPSTREAM_REPO} authored by ${FORK_OWNER}..."
+            PRS_JSON=""
+            if ! PRS_JSON=$(gh pr list \
+              --repo "${UPSTREAM_REPO}" \
+              --author "${FORK_OWNER}" \
+              --state open \
+              --limit 200 \
+              --json number,title,headRefName,headRepositoryOwner,baseRefName,author 2>&1); then
+              echo "::error::Failed to query open PRs for ${UPSTREAM_REPO}: ${PRS_JSON}"
+              GRAND_FAILED_COUNT=$((GRAND_FAILED_COUNT + 1))
+              ALL_FAILED_ITEMS+=("${UPSTREAM_REPO}: query failed - ${PRS_JSON}")
+              continue
+            fi
+
+            MATCHING_PRS=$(echo "${PRS_JSON}" | jq -c --arg owner "${FORK_OWNER}" '
+              [ .[] | select(
+                (.author.login | ascii_downcase) == ($owner | ascii_downcase) and
+                (.headRepositoryOwner.login | ascii_downcase) == ($owner | ascii_downcase)
+              ) ]
+            ')
+
+            REPO_PRS_COUNT=$(echo "${MATCHING_PRS}" | jq 'length')
+            echo "Found ${REPO_PRS_COUNT} open PR(s) in ${UPSTREAM_REPO} matching author and head fork '${FORK_OWNER}'."
+
+            if [ "${REPO_PRS_COUNT}" -eq 0 ]; then
+              echo "No matching open pull requests in ${UPSTREAM_REPO}. Continuing."
+              continue
+            fi
+
+            GRAND_TOTAL_PRS=$((GRAND_TOTAL_PRS + REPO_PRS_COUNT))
+
+            TMP_PRS_FILE=$(mktemp)
+            echo "${MATCHING_PRS}" | jq -c '.[]' > "${TMP_PRS_FILE}"
+
+            while IFS= read -r pr; do
+              [ -z "$pr" ] && continue
+
+              PR_NUMBER=$(echo "$pr" | jq -r '.number')
+              PR_TITLE=$(echo "$pr" | jq -r '.title')
+              BASE_REF=$(echo "$pr" | jq -r '.baseRefName')
+              HEAD_REF=$(echo "$pr" | jq -r '.headRefName')
+              HEAD_OWNER=$(echo "$pr" | jq -r '.headRepositoryOwner.login')
+
+              echo ""
+              echo "------------------------------------------------------------"
+              echo "[${UPSTREAM_REPO}] Processing PR #${PR_NUMBER}: ${PR_TITLE}"
+              echo "  Base: ${BASE_REF} | Head: ${HEAD_OWNER}:${HEAD_REF}"
+
+              COMPARE_PATH="/repos/${UPSTREAM_REPO}/compare/${BASE_REF}...${HEAD_OWNER}:${HEAD_REF}"
+              COMPARE_RES=""
+              if ! COMPARE_RES=$(gh api "$COMPARE_PATH" 2>&1); then
+                echo "::warning::[${UPSTREAM_REPO}] PR #${PR_NUMBER} - Failed to compare branch against base: ${COMPARE_RES}"
+                GRAND_FAILED_COUNT=$((GRAND_FAILED_COUNT + 1))
+                ALL_FAILED_ITEMS+=("${UPSTREAM_REPO} PR #${PR_NUMBER} (${PR_TITLE}): compare call failed - ${COMPARE_RES}")
+                continue
+              fi
+
+              BEHIND_BY=$(echo "$COMPARE_RES" | jq -r '.behind_by // empty')
+              if [ -z "$BEHIND_BY" ]; then
+                echo "::warning::[${UPSTREAM_REPO}] PR #${PR_NUMBER} - Could not determine commit count behind base."
+                GRAND_FAILED_COUNT=$((GRAND_FAILED_COUNT + 1))
+                ALL_FAILED_ITEMS+=("${UPSTREAM_REPO} PR #${PR_NUMBER} (${PR_TITLE}): missing behind_by in compare response")
+                continue
+              fi
+
+              if [ "$BEHIND_BY" -eq 0 ]; then
+                echo "  Status: Up to date with ${BASE_REF} (behind by 0 commits). No action needed."
+                GRAND_UP_TO_DATE_COUNT=$((GRAND_UP_TO_DATE_COUNT + 1))
+                continue
+              fi
+
+              echo "  Status: Behind ${BASE_REF} by ${BEHIND_BY} commit(s). Updating PR branch..."
+
+              UPDATE_RES=""
+              if UPDATE_RES=$(gh pr update-branch "$PR_NUMBER" --repo "$UPSTREAM_REPO" 2>&1); then
+                echo "  Success: Updated PR #${PR_NUMBER} from base branch '${BASE_REF}'."
+                GRAND_UPDATED_COUNT=$((GRAND_UPDATED_COUNT + 1))
+              else
+                echo "::error::[${UPSTREAM_REPO}] PR #${PR_NUMBER} - Failed to update branch: ${UPDATE_RES}"
+                if [[ "$UPDATE_RES" =~ "403" || "$UPDATE_RES" =~ "permission" || "$UPDATE_RES" =~ "Resource not accessible" ]]; then
+                  echo "::notice::[${UPSTREAM_REPO}] PR #${PR_NUMBER} permission error: updating fork PRs against upstream requires a personal access token with repo/contents write access configured in repository secrets (such as secrets.GH_PAT)."
+                elif [[ "$UPDATE_RES" =~ "conflict" || "$UPDATE_RES" =~ "422" ]]; then
+                  echo "::notice::[${UPSTREAM_REPO}] PR #${PR_NUMBER} has merge conflicts with base branch '${BASE_REF}'. Manual resolution is required."
+                fi
+                GRAND_FAILED_COUNT=$((GRAND_FAILED_COUNT + 1))
+                ALL_FAILED_ITEMS+=("${UPSTREAM_REPO} PR #${PR_NUMBER} (${PR_TITLE}): ${UPDATE_RES}")
+              fi
+            done < "${TMP_PRS_FILE}"
+
+            rm -f "${TMP_PRS_FILE}"
+          done
+
+          echo ""
+          echo "============================================================"
+          echo "Global Execution Summary:"
+          echo "  Total matching PRs:     ${GRAND_TOTAL_PRS}"
+          echo "  Already up to date:     ${GRAND_UP_TO_DATE_COUNT}"
+          echo "  Successfully updated:   ${GRAND_UPDATED_COUNT}"
+          echo "  Failed to update:       ${GRAND_FAILED_COUNT}"
+          echo "============================================================"
+
+          if [ "${GRAND_FAILED_COUNT}" -gt 0 ]; then
+            echo ""
+            echo "Failed items breakdown:"
+            for item in "${ALL_FAILED_ITEMS[@]}"; do
+              echo "  * ${item}"
+            done
+            exit 1
+          fi
